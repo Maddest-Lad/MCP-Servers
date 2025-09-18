@@ -11,6 +11,8 @@ dependencies = [
     "beautifulsoup4>=4.12.0",
     "markdownify>=0.11.0",
     "duckduckgo-search>=4.0.0",
+    "yt-dlp>=2023.7.6",
+    "mutagen>=1.47.0",
 ]
 
 [project.optional-dependencies]
@@ -23,6 +25,7 @@ dev = [
 
 [project.scripts]
 web-mcp = "src.servers.web:main"
+yt-dlp-mcp = "src.servers.yt_dlp:main"
 
 [build-system]
 requires = ["hatchling"]

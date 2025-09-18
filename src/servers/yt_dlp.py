@@ -1,356 +1,519 @@
-"""Media MCP Server - yt-dlp wrapper using shared process utilities."""
+"""
+Media MCP Server - yt-dlp minimal toolkit.
+
+Tools:
+- get_info: Extract metadata from URL
+- download_video: Download video content
+- download_audio: Download audio content
+- set_metadata: Edit tags post-download
+- get_agent_instructions: LLM usage guidance
+"""
 
 from __future__ import annotations
 
-import json
+import asyncio
 import logging
-import os
-from typing import Any, Mapping
+import time
+from enum import Enum
+from pathlib import Path
+from typing import Any
 
+import yt_dlp
 from fastmcp import FastMCP
-
-from ..utils.process_helpers import (
-    ProcResult,
-    ProcSpec,
-    check_dependencies,
-    err_response,
-    get_help_for_command,
-    handle_process_errors,
-    ok_response,
-    run_process,
-    which_all,
-)
+from mutagen.flac import FLAC
+from mutagen.id3 import ID3
+from mutagen.id3._frames import APIC, COMM, TALB, TDRC, TIT2, TPE1
+from mutagen.id3._util import ID3NoHeaderError
+from mutagen.mp4 import MP4, MP4Cover
+from mutagen.oggopus import OggOpus
+from mutagen.oggvorbis import OggVorbis
 
 logger = logging.getLogger(__name__)
-mcp = FastMCP("yt-dlp")
+mcp = FastMCP("yt-dlp-min")
 
 
 # ---------------------------
-# RESOURCES
+# Enums
 # ---------------------------
+class VideoPreset(Enum):
+    BEST = "bestvideo+bestaudio/best"
+    P1080 = "bestvideo[height<=1080]+bestaudio/best[height<=1080]"
+    P720 = "bestvideo[height<=720]+bestaudio/best[height<=720]"
+    P480 = "bestvideo[height<=480]+bestaudio/best[height<=480]"
+    P360 = "bestvideo[height<=360]+bestaudio/best[height<=360]"
 
 
-@mcp.resource("urn:proc:help")
-async def resource_proc_help(command: str, flags: list[str] | None = None) -> str:
-    """
-    Return stdout/stderr of `<command> <flag>` where flag is tried in order.
-    Tries: ['--help', '-h', '-H'] then `man <command>` as best effort.
-    """
-    return await get_help_for_command(command, flags)
-
-
-@mcp.resource("urn:yt-dlp:version")
-async def resource_yt_dlp_version() -> str:
-    """Return yt-dlp version and basic diagnostic flags."""
-    need_err = check_dependencies("yt-dlp")
-    if need_err:
-        return need_err
-    res = await run_process(ProcSpec(argv=["yt-dlp", "--version"], timeout_s=10))
-    return ok_response(
-        success=res.success,
-        stdout=res.stdout,
-        stderr=res.stderr,
-        command=res.command_str,
-    )
-
-
-@mcp.resource("urn:yt-dlp:extractors")
-async def resource_yt_dlp_extractors() -> str:
-    """List all available extractors."""
-    need_err = check_dependencies("yt-dlp")
-    if need_err:
-        return need_err
-    res = await run_process(
-        ProcSpec(argv=["yt-dlp", "--list-extractors"], timeout_s=30)
-    )
-    return ok_response(
-        success=res.success,
-        stdout=res.stdout,
-        stderr=res.stderr,
-        command=res.command_str,
-    )
-
-
-@mcp.resource("urn:yt-dlp:formats")
-async def resource_yt_dlp_formats(url: str) -> str:
-    """List available formats for a specific URL (`yt-dlp -F`)."""
-    need_err = check_dependencies("yt-dlp")
-    if need_err:
-        return need_err
-    res = await run_process(ProcSpec(argv=["yt-dlp", "-F", url], timeout_s=60))
-    return ok_response(
-        success=res.success,
-        stdout=res.stdout,
-        stderr=res.stderr,
-        command=res.command_str,
-        url=url,
-    )
+class AudioCodec(Enum):
+    MP3 = "mp3"
+    M4A = "m4a"
+    OPUS = "opus"
+    FLAC = "flac"
+    WAV = "wav"
+    BEST = "best"
 
 
 # ---------------------------
-# TOOLS
+# Defaults
 # ---------------------------
+DEFAULT_DOWNLOAD_DIR = Path.home() / "Downloads"
+DEFAULT_FILENAME_TEMPLATE = "%(title)s.%(ext)s"
 
 
+# ---------------------------
+# Helpers
+# ---------------------------
+def get_download_dir(output_dir: str | None = None) -> Path:
+    """Get and ensure download directory exists."""
+    dir_path = Path(output_dir) if output_dir else DEFAULT_DOWNLOAD_DIR
+    dir_path.mkdir(parents=True, exist_ok=True)
+    return dir_path
+
+
+def get_output_template(output_dir: Path, template: str | None = None) -> str:
+    """Build full output path template."""
+    tmpl = template or DEFAULT_FILENAME_TEMPLATE
+    return str(output_dir / tmpl)
+
+
+def extract_basic_metadata(info: dict[str, Any]) -> dict[str, Any]:
+    """Extract essential metadata fields."""
+    return {
+        "id": info.get("id"),
+        "title": info.get("title"),
+        "uploader": info.get("uploader") or info.get("channel"),
+        "uploader_id": info.get("uploader_id") or info.get("channel_id"),
+        "duration": info.get("duration"),
+        "upload_date": info.get("upload_date"),
+        "webpage_url": info.get("webpage_url"),
+    }
+
+
+async def run_yt_dlp(func, *args, **kwargs):
+    """Run yt-dlp function in thread pool."""
+    return await asyncio.to_thread(func, *args, **kwargs)
+
+
+def get_final_path(info: dict[str, Any], opts: dict[str, Any]) -> Path | None:
+    """Calculate the actual output filepath after all postprocessing."""
+    try:
+        # Use yt-dlp's prepare_filename to get the actual path
+        with yt_dlp.YoutubeDL(opts) as ydl:  # type: ignore
+            filename = ydl.prepare_filename(info)  # type: ignore
+
+            # For audio extraction, update extension
+            if any(
+                pp.get("key") == "FFmpegExtractAudio"
+                for pp in opts.get("postprocessors", [])
+            ):
+                for pp in opts["postprocessors"]:
+                    if pp.get("key") == "FFmpegExtractAudio":
+                        codec = pp.get("preferredcodec", "mp3")
+                        # Handle 'best' codec
+                        if codec == "best":
+                            codec = info.get("ext", "mp3")
+                        filename = Path(filename).with_suffix(f".{codec}")
+                        break
+
+            # For video merge format
+            elif opts.get("merge_output_format"):
+                filename = Path(filename).with_suffix(f'.{opts["merge_output_format"]}')
+
+            return Path(filename)
+    except Exception as e:
+        logger.warning(f"Could not determine final path: {e}")
+        return None
+
+
+# ---------------------------
+# Tools
+# ---------------------------
 @mcp.tool
-@handle_process_errors
-async def yt_dlp_get_info(
+async def get_info(
     url: str,
-    playlist_items: str | None = None,
-    flat_playlist: bool = False,
-    timeout_s: float | None = None,
-) -> str:
+    include_formats: bool = False,
+    list_subtitles: bool = False,
+    verbose: bool = False,
+) -> dict[str, Any]:
     """
-    Get structured info for a video/playlist without downloading.
+    Get video/audio metadata from URL.
 
     Args:
-        url: Video/playlist URL
-        playlist_items: e.g. "1-5" or "1,3,7" to limit items (optional)
-        flat_playlist: If True, do not resolve each video, just entries
-        timeout_s: Optional timeout in seconds
+        url: Media URL to analyze
+        include_formats: Include available format details
+        list_subtitles: List available subtitles
+        verbose: Include extended metadata
 
     Returns:
-        JSON string with video/playlist information
+        Metadata dictionary with basic info, optional formats, and thumbnails
     """
-    need_err = check_dependencies("yt-dlp")
-    if need_err:
-        return need_err
+    opts = {
+        "quiet": True,
+        "no_warnings": True,
+        "extract_flat": False,
+    }
+    if list_subtitles:
+        opts["listsubtitles"] = True
 
-    argv: list[str] = ["yt-dlp", "-J", "--no-download", url]
-    if playlist_items:
-        argv += ["--playlist-items", playlist_items]
-    if flat_playlist:
-        argv.append("--flat-playlist")
+    start_time = time.time()
 
-    res: ProcResult = await run_process(ProcSpec(argv=argv, timeout_s=timeout_s))
-    if not res.success:
-        return err_response(
-            "yt-dlp get info failed",
-            command=res.command_str,
-            stdout=res.stdout,
-            stderr=res.stderr,
-        )
+    def extract():
+        with yt_dlp.YoutubeDL(opts) as ydl:  # type: ignore
+            return ydl.extract_info(url, download=False)
 
-    # yt-dlp -J returns a single JSON object (playlist or video)
-    try:
-        data = json.loads(res.stdout)
-    except json.JSONDecodeError:
-        return err_response(
-            "Failed to parse yt-dlp JSON", stdout=res.stdout, stderr=res.stderr
-        )
+    info = await run_yt_dlp(extract)
+    elapsed = round(time.time() - start_time, 3)
 
-    return ok_response(
-        url=url,
-        info=data,
-        meta={
-            "returncode": res.returncode,
-            "command": res.command_str,
-            "duration_s": res.duration_s,
-        },
-    )
+    result = {
+        "url": url,
+        "metadata": extract_basic_metadata(info),
+        "extraction_time_s": elapsed,
+    }
+
+    if include_formats:
+        result["formats"] = info.get("formats", [])
+
+    if verbose:
+        result["thumbnails"] = info.get("thumbnails", [])[:3]
+        result["description"] = info.get("description")
+
+    return result
 
 
 @mcp.tool
-@handle_process_errors
-async def yt_dlp_download(
+async def download_video(
     url: str,
-    output_dir: str = ".",
-    format_selector: str = "best",
-    extract_audio: bool = False,
-    audio_format: str = "mp3",
-    additional_args: list[str] | None = None,
-    output_template: str | None = None,
-    timeout_s: float | None = None,
-    env: Mapping[str, str] | None = None,
-) -> str:
+    output_dir: str | None = None,
+    filename_template: str | None = None,
+    preset: VideoPreset = VideoPreset.BEST,
+    merge_format: str = "mp4",
+) -> dict[str, Any]:
     """
-    Download media via yt-dlp with consistent, structured results.
+    Download video content.
 
     Args:
-      url: Source URL
-      output_dir: Directory to save downloads (created if missing)
-      format_selector: Format selector (ignored if extract_audio=True)
-      extract_audio: If True, use --extract-audio
-      audio_format: Target audio format (mp3, flac, m4a, opus, ...)
-      additional_args: Extra args forwarded to yt-dlp
-      output_template: Custom template; defaults to "%(title)s.%(ext)s" inside output_dir
-      timeout_s: Kill after N seconds (0/None = no timeout)
-      env: Extra environment vars for the process
+        url: Video URL to download
+        output_dir: Directory for output (defaults to ~/Downloads)
+        filename_template: Output filename template (yt-dlp format)
+        preset: Video quality preset
+        merge_format: Output container format (mp4, mkv, webm, etc)
+
+    Returns:
+        Download results with file path and metadata
     """
-    need_err = check_dependencies("yt-dlp")
-    if need_err:
-        return need_err
+    dir_path = get_download_dir(output_dir)
 
-    os.makedirs(output_dir, exist_ok=True)
-    template = output_template or "%(title)s.%(ext)s"
+    opts = {
+        "quiet": True,
+        "no_warnings": True,
+        "format": preset.value,
+        "outtmpl": get_output_template(dir_path, filename_template),
+        "merge_output_format": merge_format,
+        "postprocessors": [
+            {"key": "FFmpegVideoConvertor", "preferedformat": merge_format}
+        ],
+    }
 
-    argv: list[str] = ["yt-dlp", "--print-json", "--newline", "-o", template]
+    start_time = time.time()
 
-    if extract_audio:
-        argv += ["--extract-audio", "--audio-format", audio_format]
-    else:
-        argv += ["-f", format_selector]
+    # Extract info first to get the final path
+    def extract():
+        with yt_dlp.YoutubeDL(opts) as ydl:  # type: ignore
+            return ydl.extract_info(url, download=False)
 
-    if additional_args:
-        argv += additional_args
+    info = await run_yt_dlp(extract)
 
-    argv.append(url)
+    # Calculate the actual output path
+    final_path = get_final_path(info, opts)
 
-    # Run with cwd=output_dir so template resolves inside it
-    res: ProcResult = await run_process(
-        ProcSpec(
-            argv=argv,
-            cwd=output_dir,
-            env=env,
-            timeout_s=timeout_s,
-        )
-    )
+    # Now download
+    def download():
+        with yt_dlp.YoutubeDL(opts) as ydl:  # type: ignore
+            ydl.download([url])
 
-    if not res.success:
-        return err_response(
-            "yt-dlp download failed",
-            command=res.command_str,
-            stdout=res.stdout,
-            stderr=res.stderr,
-            output_directory=output_dir,
-        )
+    await run_yt_dlp(download)
 
-    # stdout may contain multiple JSON lines (progress + final). Keep only JSON objects.
-    videos: list[dict[str, Any]] = []
-    for line in res.stdout.splitlines():
-        line = line.strip()
-        if not line:
-            continue
-        try:
-            obj = json.loads(line)
-            if isinstance(obj, dict):
-                videos.append(obj)
-        except json.JSONDecodeError:
-            # progress or non-JSON line; ignore
-            pass
+    elapsed = round(time.time() - start_time, 3)
 
-    return ok_response(
-        command=res.command_str,
-        output_directory=output_dir,
-        items=videos,
-        stderr=res.stderr,
-        meta={"returncode": res.returncode, "duration_s": res.duration_s},
-    )
+    return {
+        "url": url,
+        "file_path": str(final_path) if final_path else None,
+        "output_dir": str(dir_path),
+        "metadata": extract_basic_metadata(info),
+        "preset": preset.name,
+        "format": preset.value,
+        "merge_format": merge_format,
+        "download_time_s": elapsed,
+    }
 
 
 @mcp.tool
-@handle_process_errors
-async def yt_dlp_bulk(
-    urls: list[str],
-    output_dir: str = ".",
-    format_selector: str = "best",
-    extract_audio: bool = False,
-    audio_format: str = "mp3",
-    shared_additional_args: list[str] | None = None,
-    per_item_additional_args: list[list[str]] | None = None,
-    output_template: str | None = None,
-    timeout_s: float | None = None,
-    stop_on_error: bool = True,
-) -> str:
+async def download_audio(
+    url: str,
+    output_dir: str | None = None,
+    filename_template: str | None = None,
+    codec: AudioCodec = AudioCodec.MP3,
+    quality_kbps: int | None = None,
+    embed_thumbnail: bool = False,
+) -> dict[str, Any]:
     """
-    Download multiple URLs in sequence.
+    Download and extract audio.
 
     Args:
-      urls: List of URLs
-      output_dir: Common directory (created if missing)
-      format_selector / extract_audio / audio_format: same as single download
-      shared_additional_args: args applied to every item
-      per_item_additional_args: list aligned with `urls`, each a list of extra args
-      output_template: Custom yt-dlp -o template (defaults to "%(title)s.%(ext)s")
-      timeout_s: Optional timeout per item
-      stop_on_error: Stop on first failure if True
+        url: Media URL to download
+        output_dir: Directory for output (defaults to ~/Downloads)
+        filename_template: Output filename template (yt-dlp format)
+        codec: Audio codec/format
+        quality_kbps: Bitrate in kbps (defaults to best available)
+        embed_thumbnail: Embed thumbnail in audio file
+
+    Returns:
+        Download results with file path and metadata
     """
-    need_err = check_dependencies("yt-dlp")
-    if need_err:
-        return need_err
+    dir_path = get_download_dir(output_dir)
 
-    if not urls:
-        return err_response("urls must not be empty")
+    postprocessors = [
+        {
+            "key": "FFmpegExtractAudio",
+            "preferredcodec": codec.value,
+            "preferredquality": str(quality_kbps) if quality_kbps else "0",
+        }
+    ]
 
-    os.makedirs(output_dir, exist_ok=True)
-    template = output_template or "%(title)s.%(ext)s"
+    if embed_thumbnail:
+        postprocessors.append({"key": "EmbedThumbnail"})
 
-    results: list[dict[str, Any]] = []
+    opts = {
+        "quiet": True,
+        "no_warnings": True,
+        "format": "bestaudio/best",
+        "outtmpl": get_output_template(dir_path, filename_template),
+        "postprocessors": postprocessors,
+    }
 
-    for idx, url in enumerate(urls):
-        argv: list[str] = ["yt-dlp", "--print-json", "--newline", "-o", template]
+    start_time = time.time()
 
-        if extract_audio:
-            argv += ["--extract-audio", "--audio-format", audio_format]
-        else:
-            argv += ["-f", format_selector]
+    # Extract info first
+    def extract():
+        with yt_dlp.YoutubeDL(opts) as ydl:  # type: ignore
+            return ydl.extract_info(url, download=False)
 
-        if shared_additional_args:
-            argv += shared_additional_args
+    info = await run_yt_dlp(extract)
 
-        if (
-            per_item_additional_args
-            and idx < len(per_item_additional_args)
-            and per_item_additional_args[idx]
-        ):
-            argv += per_item_additional_args[idx]
+    # Calculate the actual output path
+    final_path = get_final_path(info, opts)
 
-        argv.append(url)
+    # Download
+    def download():
+        with yt_dlp.YoutubeDL(opts) as ydl:  # type: ignore
+            ydl.download([url])
 
-        res: ProcResult = await run_process(
-            ProcSpec(argv=argv, cwd=output_dir, timeout_s=timeout_s)
-        )
+    await run_yt_dlp(download)
 
-        if res.success:
-            items: list[dict[str, Any]] = []
-            for line in res.stdout.splitlines():
-                line = line.strip()
-                if not line:
-                    continue
-                try:
-                    obj = json.loads(line)
-                    if isinstance(obj, dict):
-                        items.append(obj)
-                except json.JSONDecodeError:
-                    pass
+    elapsed = round(time.time() - start_time, 3)
 
-            results.append(
-                {
-                    "success": True,
-                    "url": url,
-                    "items": items,
-                    "stderr": res.stderr,
-                    "meta": {
-                        "returncode": res.returncode,
-                        "command": res.command_str,
-                        "duration_s": res.duration_s,
-                    },
-                }
-            )
-        else:
-            results.append(
-                {
-                    "success": False,
-                    "url": url,
-                    "error": "yt-dlp download failed",
-                    "stdout": res.stdout,
-                    "stderr": res.stderr,
-                    "meta": {
-                        "returncode": res.returncode,
-                        "command": res.command_str,
-                        "duration_s": res.duration_s,
-                    },
-                }
-            )
-            if stop_on_error:
-                break
-
-    return ok_response(results=results, output_directory=output_dir)
+    return {
+        "url": url,
+        "file_path": str(final_path) if final_path else None,
+        "output_dir": str(dir_path),
+        "metadata": extract_basic_metadata(info),
+        "codec": codec.value,
+        "quality_kbps": quality_kbps,
+        "download_time_s": elapsed,
+    }
 
 
-def main():
-    # Soft check (server can still start)
-    _ = which_all("yt-dlp")
+@mcp.tool
+async def set_metadata(
+    file_path: str,
+    title: str | None = None,
+    artist: str | None = None,
+    album: str | None = None,
+    date: str | None = None,
+    comment: str | None = None,
+    cover_image_path: str | None = None,
+) -> dict[str, Any]:
+    """
+    Update metadata tags on audio files.
+
+    Args:
+        file_path: Path to audio file
+        title: Track title
+        artist: Artist name
+        album: Album name
+        date: Release date
+        comment: Comment text
+        cover_image_path: Path to cover image file
+
+    Returns:
+        Updated fields confirmation
+    """
+    path = Path(file_path)
+    if not path.exists():
+        raise FileNotFoundError(f"File not found: {file_path}")
+
+    ext = path.suffix.lower().lstrip(".")
+    updated = {}
+
+    # Update function to reduce duplication
+    def update_field(field_name: str, value: Any) -> None:
+        if value:
+            updated[field_name] = value
+
+    if ext == "mp3":
+        try:
+            tags = ID3(str(path))
+        except ID3NoHeaderError:
+            tags = ID3()
+
+        if title:
+            tags["TIT2"] = TIT2(encoding=3, text=title)
+            update_field("title", title)
+        if artist:
+            tags["TPE1"] = TPE1(encoding=3, text=artist)
+            update_field("artist", artist)
+        if album:
+            tags["TALB"] = TALB(encoding=3, text=album)
+            update_field("album", album)
+        if date:
+            tags["TDRC"] = TDRC(encoding=3, text=date)
+            update_field("date", date)
+        if comment:
+            tags["COMM"] = COMM(encoding=3, lang="eng", desc="", text=comment)
+            update_field("comment", comment)
+        if cover_image_path and Path(cover_image_path).exists():
+            with open(cover_image_path, "rb") as f:
+                tags["APIC"] = APIC(
+                    encoding=3,
+                    mime="image/jpeg",
+                    type=3,
+                    desc="Cover",
+                    data=f.read(),
+                )
+            update_field("cover", cover_image_path)
+        tags.save(str(path))
+
+    elif ext in ("m4a", "mp4", "aac"):
+        tags = MP4(str(path))
+
+        field_map = {
+            "title": ("\xa9nam", title),
+            "artist": ("\xa9ART", artist),
+            "album": ("\xa9alb", album),
+            "date": ("\xa9day", date),
+            "comment": ("\xa9cmt", comment),
+        }
+
+        for field, (tag, value) in field_map.items():
+            if value:
+                tags[tag] = [value]
+                update_field(field, value)
+
+        if cover_image_path and Path(cover_image_path).exists():
+            with open(cover_image_path, "rb") as f:
+                tags["covr"] = [MP4Cover(f.read(), imageformat=MP4Cover.FORMAT_JPEG)]
+            update_field("cover", cover_image_path)
+
+        tags.save()
+
+    elif ext in ("flac", "ogg", "opus"):
+        # Handle Vorbis-style tags
+        if ext == "flac":
+            tags = FLAC(str(path))
+        elif ext == "ogg":
+            tags = OggVorbis(str(path))
+        else:  # opus
+            tags = OggOpus(str(path))
+
+        field_map = {
+            "title": title,
+            "artist": artist,
+            "album": album,
+            "date": date,
+            "comment": comment,
+        }
+
+        for field, value in field_map.items():
+            if value:
+                tags[field] = [value]
+                update_field(field, value)
+
+        tags.save()
+
+    else:
+        raise ValueError(f"Unsupported file type for tagging: .{ext}")
+
+    return {"file": str(path), "updated": updated}
+
+
+@mcp.tool
+async def get_agent_instructions() -> str:
+    """
+    Get LLM usage instructions for this toolkit.
+    """
+    return """
+# Media Download Assistant Instructions
+
+## REQUIRED WORKFLOW (always follow in order):
+
+### 1. GET INFO FIRST (mandatory)
+```
+result = await get_info(url)
+```
+- **ALWAYS** call this before any download
+- Analyze the metadata and available formats
+- Use `include_formats=True` to see all quality options
+
+### 2. DOWNLOAD CONTENT
+
+**For video:**
+```
+result = await download_video(
+    url,
+    output_dir="/path/to/dir",  # optional, defaults to ~/Downloads
+    filename_template="%(title)s - %(uploader)s.%(ext)s",  # optional
+    preset=VideoPreset.P1080,  # or BEST, P720, P480, P360
+    merge_format="mp4"  # or mkv, webm, etc
+)
+```
+
+**For audio:**
+```
+result = await download_audio(
+    url,
+    output_dir="/path/to/dir",  # optional
+    codec=AudioCodec.MP3,  # or M4A, OPUS, FLAC, WAV
+    quality_kbps=320,  # optional, defaults to best
+    embed_thumbnail=True  # optional
+)
+```
+
+### 3. SET METADATA (automatic for audio)
+
+**For audio files (do this automatically):**
+```
+await set_metadata(
+    file_path=result["file_path"],
+    title=info["metadata"]["title"],
+    artist=info["metadata"]["uploader"],
+    album="Downloaded Audio",
+    date=info["metadata"]["upload_date"],
+    comment=f"Source: {url}"
+)
+```
+
+## Key Points:
+- The file_path in download results is the final output file after all processing
+- Always use the metadata from get_info to populate set_metadata
+- For audio, always set metadata unless user says not to
+- Return the final file path to the user
+""".strip()
+
+
+# ---------------------------
+# Entry point
+# ---------------------------
+def main() -> None:
+    logger.info("yt-dlp-min server starting")
     mcp.run()
 
 
