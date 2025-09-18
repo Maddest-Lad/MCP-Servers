@@ -10,9 +10,16 @@ import shlex
 import shutil
 import time
 from dataclasses import asdict, dataclass
+from functools import wraps
 from typing import Any, Mapping, Sequence
 
 logger = logging.getLogger(__name__)
+
+
+class ProcessError(Exception):
+    """Custom exception for process-related errors."""
+
+    pass
 
 
 def which_all(*commands: str) -> tuple[bool, list[str]]:
@@ -87,17 +94,18 @@ async def run_process(spec: ProcSpec) -> ProcResult:
                 await proc.communicate()
             finally:
                 ended = time.time()
-                return ProcResult(
-                    success=False,
-                    returncode=-1,
-                    argv=spec.argv,
-                    command_str=cmd_str,
-                    stdout="",
-                    stderr=f"Process timed out after {spec.timeout_s} seconds.",
-                    started_at=started,
-                    ended_at=ended,
-                    duration_s=ended - started,
-                )
+
+            return ProcResult(
+                success=False,
+                returncode=-1,
+                argv=spec.argv,
+                command_str=cmd_str,
+                stdout="",
+                stderr=f"Process timed out after {spec.timeout_s} seconds.",
+                started_at=started,
+                ended_at=ended,
+                duration_s=ended - started,
+            )
 
         ended = time.time()
         return ProcResult(
@@ -134,3 +142,68 @@ def ok_response(**data: Any) -> str:
 
 def err_response(error: str, **data: Any) -> str:
     return json.dumps({"success": False, "error": error, **data}, indent=2)
+
+
+def check_dependencies(*bins: str) -> str | None:
+    """Check for required binary dependencies and return error if missing."""
+    ok, missing = which_all(*bins)
+    if not ok:
+        return err_response(f"Missing dependencies: {', '.join(missing)}")
+    return None
+
+
+def handle_process_errors(func):
+    """
+    Decorator for handling process-related errors with intelligent messages.
+
+    Similar to web_helpers.handle_web_request_errors but for process operations.
+    """
+
+    @wraps(func)
+    async def wrapper(*args, **kwargs):
+        try:
+            return await func(*args, **kwargs)
+        except ProcessError as e:
+            return err_response(str(e))
+        except Exception as e:
+            logger.exception("Unexpected error in process operation")
+            return err_response(f"Process operation failed: {str(e)}")
+
+    return wrapper
+
+
+async def get_help_for_command(
+    command: str, flags: list[str] | None = None, timeout_s: float = 12
+) -> str:
+    """
+    Generic helper to get help for a command by trying various help flags.
+
+    Args:
+        command: The command to get help for
+        flags: List of help flags to try (defaults to common ones)
+        timeout_s: Timeout for each attempt
+
+    Returns:
+        JSON response with help content or error
+    """
+    tried: list[dict[str, Any]] = []
+    choices = flags or ["--help", "-h", "-H"]
+
+    # First try `command {flag}`
+    for f in choices:
+        res = await run_process(ProcSpec(argv=[command, f], timeout_s=timeout_s))
+        tried.append({"argv": [command, f], "returncode": res.returncode})
+        if res.success or res.returncode in (0, 1):  # some tools return 1 for help
+            return ok_response(
+                command=res.command_str, stdout=res.stdout, stderr=res.stderr
+            )
+
+    # Fallback to `man command` (may not exist on Windows or slim containers)
+    res = await run_process(ProcSpec(argv=["man", command], timeout_s=timeout_s))
+    tried.append({"argv": ["man", command], "returncode": res.returncode})
+    if res.success:
+        return ok_response(
+            command=res.command_str, stdout=res.stdout, stderr=res.stderr
+        )
+
+    return err_response("Help/man not available", attempts=tried)

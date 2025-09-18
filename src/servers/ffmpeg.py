@@ -18,7 +18,10 @@ from fastmcp import FastMCP
 from ..utils.process_helpers import (
     ProcResult,
     ProcSpec,
+    check_dependencies,
     err_response,
+    get_help_for_command,
+    handle_process_errors,
     ok_response,
     run_process,
     which_all,
@@ -28,40 +31,13 @@ logger = logging.getLogger(__name__)
 mcp = FastMCP("ffmpeg")
 
 
-def _need(*bins: str) -> str | None:
-    ok, missing = which_all(*bins)
-    if not ok:
-        return err_response(f"Missing dependencies: {', '.join(missing)}")
-    return None
-
-
 @mcp.resource("urn:proc:help")
 async def resource_proc_help(command: str, flags: list[str] | None = None) -> str:
     """
     Return stdout/stderr of `<command> <flag>` where flag is tried in order.
     Defaults to trying: ['--help', '-h', '-H'] and then `man <command>` (best effort).
     """
-    tried: list[dict[str, Any]] = []
-    choices = flags or ["--help", "-h", "-H"]
-
-    # First try `command {flag}`
-    for f in choices:
-        res = await run_process(ProcSpec(argv=[command, f], timeout_s=12))
-        tried.append({"argv": [command, f], "returncode": res.returncode})
-        if res.success or res.returncode in (0, 1):  # some tools return 1 for help
-            return ok_response(
-                command=res.command_str, stdout=res.stdout, stderr=res.stderr
-            )
-
-    # Fallback to `man command` (may not exist on Windows or slim containers)
-    res = await run_process(ProcSpec(argv=["man", command], timeout_s=12))
-    tried.append({"argv": ["man", command], "returncode": res.returncode})
-    if res.success:
-        return ok_response(
-            command=res.command_str, stdout=res.stdout, stderr=res.stderr
-        )
-
-    return err_response("Help/man not available", attempts=tried)
+    return await get_help_for_command(command, flags)
 
 
 @mcp.resource("urn:ffmpeg:catalog")
@@ -71,7 +47,7 @@ async def resource_ffmpeg_catalog(include: list[str] | None = None) -> str:
     - 'codecs', 'encoders', 'decoders', 'formats', 'filters', 'pix_fmts', 'bsfs', 'protocols'
     Defaults to a useful subset if not provided.
     """
-    need_err = _need("ffmpeg")
+    need_err = check_dependencies("ffmpeg")
     if need_err:
         return need_err
 
@@ -113,19 +89,17 @@ async def _run_ffmpeg_command_impl(
     argv: list[str],
     cwd: str | None = None,
     env: Mapping[str, str] | None = None,
-    timeout_s: float | None = 0,
+    timeout_s: float | None = None,
     ensure_output_path: str | None = None,
 ) -> str:
-    """
-    Implementation behind the tool. Safe for internal calls.
-    """
+    """Implementation behind the tool. Safe for internal calls."""
     if not argv:
         return err_response("argv must not be empty")
 
     # Dependency hinting: if argv[0] is 'ffmpeg' or 'ffprobe', check presence
     bin0 = argv[0]
     if bin0 in {"ffmpeg", "ffprobe"}:
-        need_err = _need(bin0)
+        need_err = check_dependencies(bin0)
         if need_err:
             return need_err
 
@@ -134,7 +108,7 @@ async def _run_ffmpeg_command_impl(
             argv=argv,
             cwd=cwd,
             env=env,
-            timeout_s=timeout_s or None,
+            timeout_s=timeout_s,
             ensure_output_path=ensure_output_path,
         )
     )
@@ -145,9 +119,7 @@ async def _run_ffmpeg_bulk_impl(
     commands: list[dict[str, Any]],
     stop_on_error: bool = True,
 ) -> str:
-    """
-    Implementation behind the bulk tool. Safe for internal calls.
-    """
+    """Implementation behind the bulk tool. Safe for internal calls."""
     if not commands:
         return err_response("commands must not be empty")
 
@@ -164,7 +136,7 @@ async def _run_ffmpeg_bulk_impl(
 
         bin0 = argv[0]
         if bin0 in {"ffmpeg", "ffprobe"}:
-            need_err = _need(bin0)
+            need_err = check_dependencies(bin0)
             if need_err:
                 results.append(json.loads(need_err))
                 if stop_on_error:
@@ -176,7 +148,7 @@ async def _run_ffmpeg_bulk_impl(
                 argv=argv,
                 cwd=spec.get("cwd"),
                 env=spec.get("env"),
-                timeout_s=spec.get("timeout_s") or None,
+                timeout_s=spec.get("timeout_s"),
                 ensure_output_path=spec.get("ensure_output_path"),
             )
         )
@@ -193,13 +165,27 @@ async def _run_ffmpeg_bulk_impl(
 
 
 @mcp.tool
+@handle_process_errors
 async def run_ffmpeg_command(
     argv: list[str],
     cwd: str | None = None,
     env: Mapping[str, str] | None = None,
-    timeout_s: float | None = 0,
+    timeout_s: float | None = None,
     ensure_output_path: str | None = None,
 ) -> str:
+    """
+    Execute a single FFmpeg or FFprobe command with structured output.
+
+    Args:
+        argv: Command and arguments as a list
+        cwd: Working directory (optional)
+        env: Environment variables (optional)
+        timeout_s: Command timeout in seconds (optional)
+        ensure_output_path: Create parent directories for this path (optional)
+
+    Returns:
+        JSON string with command result
+    """
     return await _run_ffmpeg_command_impl(
         argv=argv,
         cwd=cwd,
@@ -210,10 +196,21 @@ async def run_ffmpeg_command(
 
 
 @mcp.tool
+@handle_process_errors
 async def run_ffmpeg_bulk(
     commands: list[dict[str, Any]],
     stop_on_error: bool = True,
 ) -> str:
+    """
+    Execute multiple FFmpeg/FFprobe commands in sequence.
+
+    Args:
+        commands: List of command specifications (each with argv, cwd, env, etc.)
+        stop_on_error: Stop processing on first command failure (default=True)
+
+    Returns:
+        JSON string with results for all executed commands
+    """
     return await _run_ffmpeg_bulk_impl(commands=commands, stop_on_error=stop_on_error)
 
 
@@ -223,15 +220,29 @@ async def run_ffmpeg_bulk(
 
 
 @mcp.tool
+@handle_process_errors
 async def ffmpeg_extract_audio(
     input_file: str,
     output_file: str,
     audio_codec: str = "libmp3lame",
     bitrate: str = "192k",
     extra: list[str] | None = None,
-    timeout_s: float | None = 0,
+    timeout_s: float | None = None,
 ) -> str:
-    """Back-compat wrapper built on run_ffmpeg_command implementation."""
+    """
+    Extract audio from a media file using FFmpeg.
+
+    Args:
+        input_file: Path to input media file
+        output_file: Path for output audio file
+        audio_codec: Audio codec to use (default: libmp3lame)
+        bitrate: Audio bitrate (default: 192k)
+        extra: Additional FFmpeg arguments (optional)
+        timeout_s: Command timeout in seconds (optional)
+
+    Returns:
+        JSON string with extraction result
+    """
     if not os.path.exists(input_file):
         return err_response(f"Input file '{input_file}' does not exist.")
 
@@ -257,10 +268,21 @@ async def ffmpeg_extract_audio(
 
 
 @mcp.tool
+@handle_process_errors
 async def ffprobe_get_info(
-    input_file: str, pretty_json: bool = True, timeout_s: float | None = 0
+    input_file: str, pretty_json: bool = True, timeout_s: float | None = None
 ) -> str:
-    """FFprobe info (structured JSON)."""
+    """
+    Get detailed media information using FFprobe.
+
+    Args:
+        input_file: Path to media file to analyze
+        pretty_json: Whether to format JSON output nicely (default=True)
+        timeout_s: Command timeout in seconds (optional)
+
+    Returns:
+        JSON string with detailed media information
+    """
     if not os.path.exists(input_file):
         return err_response(f"Input file '{input_file}' does not exist.")
 

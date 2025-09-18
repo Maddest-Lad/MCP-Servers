@@ -12,25 +12,17 @@ from fastmcp import FastMCP
 from ..utils.process_helpers import (
     ProcResult,
     ProcSpec,
+    check_dependencies,
     err_response,
+    get_help_for_command,
+    handle_process_errors,
     ok_response,
     run_process,
     which_all,
 )
 
 logger = logging.getLogger(__name__)
-
 mcp = FastMCP("yt-dlp")
-
-
-# ---------------------------
-# Small helper for dependency checks
-# ---------------------------
-def _need(*bins: str) -> str | None:
-    ok, missing = which_all(*bins)
-    if not ok:
-        return err_response(f"Missing dependencies: {', '.join(missing)}")
-    return None
 
 
 # ---------------------------
@@ -44,32 +36,13 @@ async def resource_proc_help(command: str, flags: list[str] | None = None) -> st
     Return stdout/stderr of `<command> <flag>` where flag is tried in order.
     Tries: ['--help', '-h', '-H'] then `man <command>` as best effort.
     """
-    tried: list[dict[str, Any]] = []
-    choices = flags or ["--help", "-h", "-H"]
-
-    for f in choices:
-        res = await run_process(ProcSpec(argv=[command, f], timeout_s=12))
-        tried.append({"argv": [command, f], "returncode": res.returncode})
-        if res.success or res.returncode in (0, 1):
-            return ok_response(
-                command=res.command_str, stdout=res.stdout, stderr=res.stderr
-            )
-
-    # Fallback to `man`
-    res = await run_process(ProcSpec(argv=["man", command], timeout_s=12))
-    tried.append({"argv": ["man", command], "returncode": res.returncode})
-    if res.success:
-        return ok_response(
-            command=res.command_str, stdout=res.stdout, stderr=res.stderr
-        )
-
-    return err_response("Help/man not available", attempts=tried)
+    return await get_help_for_command(command, flags)
 
 
 @mcp.resource("urn:yt-dlp:version")
 async def resource_yt_dlp_version() -> str:
     """Return yt-dlp version and basic diagnostic flags."""
-    need_err = _need("yt-dlp")
+    need_err = check_dependencies("yt-dlp")
     if need_err:
         return need_err
     res = await run_process(ProcSpec(argv=["yt-dlp", "--version"], timeout_s=10))
@@ -84,7 +57,7 @@ async def resource_yt_dlp_version() -> str:
 @mcp.resource("urn:yt-dlp:extractors")
 async def resource_yt_dlp_extractors() -> str:
     """List all available extractors."""
-    need_err = _need("yt-dlp")
+    need_err = check_dependencies("yt-dlp")
     if need_err:
         return need_err
     res = await run_process(
@@ -101,7 +74,7 @@ async def resource_yt_dlp_extractors() -> str:
 @mcp.resource("urn:yt-dlp:formats")
 async def resource_yt_dlp_formats(url: str) -> str:
     """List available formats for a specific URL (`yt-dlp -F`)."""
-    need_err = _need("yt-dlp")
+    need_err = check_dependencies("yt-dlp")
     if need_err:
         return need_err
     res = await run_process(ProcSpec(argv=["yt-dlp", "-F", url], timeout_s=60))
@@ -120,22 +93,26 @@ async def resource_yt_dlp_formats(url: str) -> str:
 
 
 @mcp.tool
+@handle_process_errors
 async def yt_dlp_get_info(
     url: str,
     playlist_items: str | None = None,
     flat_playlist: bool = False,
-    timeout_s: float | None = 0,
+    timeout_s: float | None = None,
 ) -> str:
     """
-    Get structured info for a video/playlist without downloading (uses `-J` to return a single JSON tree).
+    Get structured info for a video/playlist without downloading.
 
     Args:
-      url: Video/playlist URL
-      playlist_items: e.g. "1-5" or "1,3,7" to limit items (optional)
-      flat_playlist: If True, do not resolve each video, just entries.
-      timeout_s: Optional timeout (0/None = no timeout)
+        url: Video/playlist URL
+        playlist_items: e.g. "1-5" or "1,3,7" to limit items (optional)
+        flat_playlist: If True, do not resolve each video, just entries
+        timeout_s: Optional timeout in seconds
+
+    Returns:
+        JSON string with video/playlist information
     """
-    need_err = _need("yt-dlp")
+    need_err = check_dependencies("yt-dlp")
     if need_err:
         return need_err
 
@@ -145,9 +122,7 @@ async def yt_dlp_get_info(
     if flat_playlist:
         argv.append("--flat-playlist")
 
-    res: ProcResult = await run_process(
-        ProcSpec(argv=argv, timeout_s=timeout_s or None)
-    )
+    res: ProcResult = await run_process(ProcSpec(argv=argv, timeout_s=timeout_s))
     if not res.success:
         return err_response(
             "yt-dlp get info failed",
@@ -176,6 +151,7 @@ async def yt_dlp_get_info(
 
 
 @mcp.tool
+@handle_process_errors
 async def yt_dlp_download(
     url: str,
     output_dir: str = ".",
@@ -184,7 +160,7 @@ async def yt_dlp_download(
     audio_format: str = "mp3",
     additional_args: list[str] | None = None,
     output_template: str | None = None,
-    timeout_s: float | None = 0,
+    timeout_s: float | None = None,
     env: Mapping[str, str] | None = None,
 ) -> str:
     """
@@ -201,7 +177,7 @@ async def yt_dlp_download(
       timeout_s: Kill after N seconds (0/None = no timeout)
       env: Extra environment vars for the process
     """
-    need_err = _need("yt-dlp")
+    need_err = check_dependencies("yt-dlp")
     if need_err:
         return need_err
 
@@ -226,7 +202,7 @@ async def yt_dlp_download(
             argv=argv,
             cwd=output_dir,
             env=env,
-            timeout_s=timeout_s or None,
+            timeout_s=timeout_s,
         )
     )
 
@@ -263,6 +239,7 @@ async def yt_dlp_download(
 
 
 @mcp.tool
+@handle_process_errors
 async def yt_dlp_bulk(
     urls: list[str],
     output_dir: str = ".",
@@ -272,7 +249,7 @@ async def yt_dlp_bulk(
     shared_additional_args: list[str] | None = None,
     per_item_additional_args: list[list[str]] | None = None,
     output_template: str | None = None,
-    timeout_s: float | None = 0,
+    timeout_s: float | None = None,
     stop_on_error: bool = True,
 ) -> str:
     """
@@ -288,7 +265,7 @@ async def yt_dlp_bulk(
       timeout_s: Optional timeout per item
       stop_on_error: Stop on first failure if True
     """
-    need_err = _need("yt-dlp")
+    need_err = check_dependencies("yt-dlp")
     if need_err:
         return need_err
 
@@ -321,7 +298,7 @@ async def yt_dlp_bulk(
         argv.append(url)
 
         res: ProcResult = await run_process(
-            ProcSpec(argv=argv, cwd=output_dir, timeout_s=timeout_s or None)
+            ProcSpec(argv=argv, cwd=output_dir, timeout_s=timeout_s)
         )
 
         if res.success:
