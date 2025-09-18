@@ -1,0 +1,13 @@
+{
+  "mcpServers": {
+    "web": {
+      "command": "uv",
+      "args": [
+        "run",
+        "-m",
+        "src.servers.web"
+      ],
+      "cwd": "C:\\Users\\sam\\Desktop\\Projects\\MCP-Servers"
+    }
+  }
+}

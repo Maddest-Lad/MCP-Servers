@@ -21,16 +21,16 @@ dev:
 
 # Server
 run:
-	uv run fastmcp run extranet.py:mcp
+	uv run -m src.servers.web
 
 run-http:
-	uv run fastmcp run extranet.py:mcp --transport http --port 8000
+	uv run fastmcp run src.servers.web:mcp --transport http --port 8000
 
 
-fix: dev-install
+fix: dev
 	uv run black .
 	uv run ruff check --fix .
 
 # Configuration
 config:
-	uv run python generate_mcp_configs.py
+	uv run python src/generate_mcp_configs.py

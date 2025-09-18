@@ -22,7 +22,7 @@ dev = [
 ]
 
 [project.scripts]
-extranet-mcp = "extranet:main"
+web-mcp = "src.servers.web:main"
 
 [build-system]
 requires = ["hatchling"]

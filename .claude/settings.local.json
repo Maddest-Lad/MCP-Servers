@@ -1,0 +1,13 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(uv *)",
+      "Bash(uv sync:*)",
+      "Bash(make:*)",
+      "Bash(python:*)",
+      "Bash(uv:*)"
+    ],
+    "deny": [],
+    "ask": []
+  }
+}

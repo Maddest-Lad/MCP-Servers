@@ -1,6 +1,17 @@
-# Extranet MCP Server
+# MCP Web Server
 
-A standalone Model Context Protocol (MCP) server that combines web search and HTTP request capabilities. This server provides tools for web scraping, search, and making HTTP requests to any URL without network restrictions.
+A Model Context Protocol (MCP) server that provides web search and HTTP request capabilities. This server provides tools for web scraping, search, and making HTTP requests to any URL without network restrictions.
+
+## Project Structure
+
+```
+src/
+├── servers/
+│   └── web.py              # Main web server with MCP tools
+├── utils/
+│   └── web_helpers.py      # Helper utilities for web operations
+└── generate_mcp_configs.py # Generate MCP client configurations
+```
 
 ## Features
 
@@ -84,11 +95,11 @@ make help
 You can also run the server directly:
 
 ```bash
-# Using uv
-uv run extranet.py
+# Using uv (recommended)
+uv run src/servers/web.py
 
 # Or directly with Python
-python extranet.py
+python src/servers/web.py
 ```
 
 ### Using with MCP Clients
@@ -98,13 +109,22 @@ Add the server to your MCP client configuration. For example, with Claude Deskto
 ```json
 {
   "mcpServers": {
-    "extranet": {
+    "web": {
       "command": "uv",
-      "args": ["run", "/path/to/standalone/extranet.py"]
+      "args": ["run", "/path/to/MCP-Servers/src/servers/web.py"],
+      "cwd": "/path/to/MCP-Servers"
     }
   }
 }
 ```
+
+Or use the configuration generator:
+
+```bash
+make config
+```
+
+This will generate both standard Python and uv-based configurations that you can copy into your MCP client.
 
 ## Tools Reference
 

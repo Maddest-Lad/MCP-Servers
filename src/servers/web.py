@@ -8,7 +8,7 @@ from duckduckgo_search import DDGS
 from fastmcp import FastMCP
 from markdownify import markdownify
 
-from helpers import (
+from ..utils.web_helpers import (
     MAX_PAGE_LENGTH,
     REQUEST_TIMEOUT,
     UNSAFE_SCHEMES,
@@ -32,7 +32,7 @@ logger = logging.getLogger(__name__)
 HttpMethod = Literal["GET", "POST", "PUT", "DELETE", "PATCH"]
 
 # Create the FastMCP server
-mcp = FastMCP("extranet")
+mcp = FastMCP("web")
 
 
 @mcp.tool
