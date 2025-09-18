@@ -12,25 +12,21 @@ help:
 	@echo "  fix          - Format code with black and ruff"
 	@echo "  config       - Generate MCP client configuration"
 
-# Installation
+# Setup
 install:
 	uv sync --no-dev
 
+# Development
 dev:
 	uv sync --all-extras
-
-# Server
-run:
-	uv run -m src.servers.web
-
-run-http:
-	uv run fastmcp run src.servers.web:mcp --transport http --port 8000
-
 
 fix: dev
 	uv run black .
 	uv run ruff check --fix .
 
-# Configuration
+run:
+	uv run -m src.servers.web
+
+# Generate Config Files
 config:
 	uv run python src/generate_mcp_configs.py
