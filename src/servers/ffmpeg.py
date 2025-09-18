@@ -1,93 +1,225 @@
-"""FFmpeg MCP Server - Wrapper for FFmpeg media processing tools."""
+"""Universal FFmpeg MCP Server.
+
+Features:
+- Generic single/bulk execution tools (works for ffmpeg/ffprobe and friends)
+- Resources for help/manpages and FFmpeg capability catalogs
+- Optional convenience wrappers for convert/extract/info
+"""
+
+from __future__ import annotations
 
 import json
 import logging
 import os
-from typing import List, Optional
+from typing import Any, Mapping
 
 from fastmcp import FastMCP
 
-from ..utils.media_helpers import (
-    check_dependencies,
-    create_error_response,
-    create_success_response,
-    ensure_output_directory,
-    run_command,
+from ..utils.process_helpers import (
+    ProcResult,
+    ProcSpec,
+    err_response,
+    ok_response,
+    run_process,
+    which_all,
 )
 
 logger = logging.getLogger(__name__)
-
-# Create the FastMCP server
 mcp = FastMCP("ffmpeg")
 
 
-@mcp.tool
-async def ffmpeg_convert(
-    input_file: str,
-    output_file: str,
-    codec: Optional[str] = None,
-    quality: Optional[str] = None,
-    additional_args: Optional[List[str]] = None,
+def _need(*bins: str) -> str | None:
+    ok, missing = which_all(*bins)
+    if not ok:
+        return err_response(f"Missing dependencies: {', '.join(missing)}")
+    return None
+
+
+@mcp.resource("urn:proc:help")
+async def resource_proc_help(command: str, flags: list[str] | None = None) -> str:
+    """
+    Return stdout/stderr of `<command> <flag>` where flag is tried in order.
+    Defaults to trying: ['--help', '-h', '-H'] and then `man <command>` (best effort).
+    """
+    tried: list[dict[str, Any]] = []
+    choices = flags or ["--help", "-h", "-H"]
+
+    # First try `command {flag}`
+    for f in choices:
+        res = await run_process(ProcSpec(argv=[command, f], timeout_s=12))
+        tried.append({"argv": [command, f], "returncode": res.returncode})
+        if res.success or res.returncode in (0, 1):  # some tools return 1 for help
+            return ok_response(
+                command=res.command_str, stdout=res.stdout, stderr=res.stderr
+            )
+
+    # Fallback to `man command` (may not exist on Windows or slim containers)
+    res = await run_process(ProcSpec(argv=["man", command], timeout_s=12))
+    tried.append({"argv": ["man", command], "returncode": res.returncode})
+    if res.success:
+        return ok_response(
+            command=res.command_str, stdout=res.stdout, stderr=res.stderr
+        )
+
+    return err_response("Help/man not available", attempts=tried)
+
+
+@mcp.resource("urn:ffmpeg:catalog")
+async def resource_ffmpeg_catalog(include: list[str] | None = None) -> str:
+    """
+    Return FFmpeg capability catalogs. `include` can contain any of:
+    - 'codecs', 'encoders', 'decoders', 'formats', 'filters', 'pix_fmts', 'bsfs', 'protocols'
+    Defaults to a useful subset if not provided.
+    """
+    need_err = _need("ffmpeg")
+    if need_err:
+        return need_err
+
+    subset = include or ["codecs", "formats", "filters", "pix_fmts"]
+    flag_map = {
+        "codecs": ["-codecs"],
+        "encoders": ["-encoders"],
+        "decoders": ["-decoders"],
+        "formats": ["-formats"],
+        "filters": ["-filters"],
+        "pix_fmts": ["-pix_fmts"],
+        "bsfs": ["-bsfs"],
+        "protocols": ["-protocols"],
+    }
+
+    out: dict[str, dict[str, str]] = {}
+    for key in subset:
+        flags = flag_map.get(key)
+        if not flags:
+            out[key] = {"error": "unknown catalog"}
+            continue
+        res = await run_process(
+            ProcSpec(argv=["ffmpeg", "-hide_banner", *flags], timeout_s=15)
+        )
+        out[key] = {
+            "success": str(res.success).lower(),
+            "stdout": res.stdout,
+            "stderr": res.stderr,
+        }
+    return ok_response(catalog=out)
+
+
+# ---------------------------
+# INTERNAL IMPLEMENTATIONS (UNDECORATED)
+# ---------------------------
+
+
+async def _run_ffmpeg_command_impl(
+    argv: list[str],
+    cwd: str | None = None,
+    env: Mapping[str, str] | None = None,
+    timeout_s: float | None = 0,
+    ensure_output_path: str | None = None,
 ) -> str:
     """
-    Convert media files using FFmpeg.
-
-    Args:
-        input_file: Path to the input file
-        output_file: Path to the output file
-        codec: Codec to use (e.g., "libx264", "libx265", "libmp3lame")
-        quality: Quality setting (e.g., "23" for CRF, "128k" for bitrate)
-        additional_args: Additional FFmpeg arguments
-
-    Returns:
-        JSON string with conversion result.
+    Implementation behind the tool. Safe for internal calls.
     """
-    if not check_dependencies("ffmpeg", "ffprobe"):
-        return create_error_response("ffmpeg not found. Please install FFmpeg.")
+    if not argv:
+        return err_response("argv must not be empty")
 
-    if not os.path.exists(input_file):
-        return create_error_response(f"Input file '{input_file}' does not exist.")
+    # Dependency hinting: if argv[0] is 'ffmpeg' or 'ffprobe', check presence
+    bin0 = argv[0]
+    if bin0 in {"ffmpeg", "ffprobe"}:
+        need_err = _need(bin0)
+        if need_err:
+            return need_err
 
-    # Build command
-    cmd = ["ffmpeg", "-i", input_file]
-
-    if codec:
-        cmd.extend(["-c:v", codec])
-
-    if quality:
-        if quality.endswith("k"):  # Bitrate
-            cmd.extend(["-b:v", quality])
-        else:  # CRF
-            cmd.extend(["-crf", quality])
-
-    if additional_args:
-        cmd.extend(additional_args)
-
-    cmd.append(output_file)
-
-    # Create output directory if needed
-    ensure_output_directory(output_file)
-
-    result = await run_command(cmd)
-
-    return (
-        create_success_response(
-            {
-                "command": result["command"],
-                "input_file": input_file,
-                "output_file": output_file,
-                "stdout": result["stdout"],
-                "stderr": result["stderr"],
-            }
-        )
-        if result["returncode"] == 0
-        else create_error_response(
-            "FFmpeg conversion failed",
-            command=result["command"],
-            stdout=result["stdout"],
-            stderr=result["stderr"],
+    res: ProcResult = await run_process(
+        ProcSpec(
+            argv=argv,
+            cwd=cwd,
+            env=env,
+            timeout_s=timeout_s or None,
+            ensure_output_path=ensure_output_path,
         )
     )
+    return res.to_json()
+
+
+async def _run_ffmpeg_bulk_impl(
+    commands: list[dict[str, Any]],
+    stop_on_error: bool = True,
+) -> str:
+    """
+    Implementation behind the bulk tool. Safe for internal calls.
+    """
+    if not commands:
+        return err_response("commands must not be empty")
+
+    results: list[dict[str, Any]] = []
+    for idx, spec in enumerate(commands):
+        argv = spec.get("argv")
+        if not argv:
+            results.append(
+                {"success": False, "error": f"commands[{idx}].argv is required"}
+            )
+            if stop_on_error:
+                break
+            continue
+
+        bin0 = argv[0]
+        if bin0 in {"ffmpeg", "ffprobe"}:
+            need_err = _need(bin0)
+            if need_err:
+                results.append(json.loads(need_err))
+                if stop_on_error:
+                    break
+                continue
+
+        res = await run_process(
+            ProcSpec(
+                argv=argv,
+                cwd=spec.get("cwd"),
+                env=spec.get("env"),
+                timeout_s=spec.get("timeout_s") or None,
+                ensure_output_path=spec.get("ensure_output_path"),
+            )
+        )
+        results.append(json.loads(res.to_json()))
+        if stop_on_error and not res.success:
+            break
+
+    return ok_response(results=results)
+
+
+# ---------------------------
+# TOOLS (DECORATED WRAPPERS THAT DELEGATE)
+# ---------------------------
+
+
+@mcp.tool
+async def run_ffmpeg_command(
+    argv: list[str],
+    cwd: str | None = None,
+    env: Mapping[str, str] | None = None,
+    timeout_s: float | None = 0,
+    ensure_output_path: str | None = None,
+) -> str:
+    return await _run_ffmpeg_command_impl(
+        argv=argv,
+        cwd=cwd,
+        env=env,
+        timeout_s=timeout_s,
+        ensure_output_path=ensure_output_path,
+    )
+
+
+@mcp.tool
+async def run_ffmpeg_bulk(
+    commands: list[dict[str, Any]],
+    stop_on_error: bool = True,
+) -> str:
+    return await _run_ffmpeg_bulk_impl(commands=commands, stop_on_error=stop_on_error)
+
+
+# ---------------------------
+# CONVENIENCE WRAPPERS (call the IMPLEMENTATIONS)
+# ---------------------------
 
 
 @mcp.tool
@@ -96,80 +228,44 @@ async def ffmpeg_extract_audio(
     output_file: str,
     audio_codec: str = "libmp3lame",
     bitrate: str = "192k",
-    additional_args: Optional[List[str]] = None,
+    extra: list[str] | None = None,
+    timeout_s: float | None = 0,
 ) -> str:
-    """
-    Extract audio from video files using FFmpeg.
-
-    Args:
-        input_file: Path to the input video file
-        output_file: Path to the output audio file
-        audio_codec: Audio codec to use (default: "libmp3lame")
-        bitrate: Audio bitrate (default: "192k")
-        additional_args: Additional FFmpeg arguments
-
-    Returns:
-        JSON string with extraction result.
-    """
-    if not check_dependencies("ffmpeg", "ffprobe"):
-        return create_error_response("ffmpeg not found. Please install FFmpeg.")
-
+    """Back-compat wrapper built on run_ffmpeg_command implementation."""
     if not os.path.exists(input_file):
-        return create_error_response(f"Input file '{input_file}' does not exist.")
+        return err_response(f"Input file '{input_file}' does not exist.")
 
-    # Build command
-    cmd = ["ffmpeg", "-i", input_file, "-vn", "-c:a", audio_codec, "-b:a", bitrate]
+    argv: list[str] = [
+        "ffmpeg",
+        "-hide_banner",
+        "-y",
+        "-i",
+        input_file,
+        "-vn",
+        "-c:a",
+        audio_codec,
+        "-b:a",
+        bitrate,
+    ]
+    if extra:
+        argv += extra
+    argv.append(output_file)
 
-    if additional_args:
-        cmd.extend(additional_args)
-
-    cmd.append(output_file)
-
-    # Create output directory if needed
-    ensure_output_directory(output_file)
-
-    result = await run_command(cmd)
-
-    if result["returncode"] == 0:
-        return create_success_response(
-            {
-                "command": result["command"],
-                "input_file": input_file,
-                "output_file": output_file,
-                "stdout": result["stdout"],
-                "stderr": result["stderr"],
-            }
-        )
-    else:
-        return create_error_response(
-            "FFmpeg audio extraction failed",
-            command=result["command"],
-            stdout=result["stdout"],
-            stderr=result["stderr"],
-        )
+    return await _run_ffmpeg_command_impl(
+        argv=argv, ensure_output_path=output_file, timeout_s=timeout_s
+    )
 
 
 @mcp.tool
-async def ffmpeg_get_info(input_file: str) -> str:
-    """
-    Get detailed information about a media file using FFprobe.
-
-    Args:
-        input_file: Path to the media file
-
-    Returns:
-        JSON string with media file information.
-    """
-    if not check_dependencies("ffprobe"):
-        return create_error_response(
-            "ffprobe not found. Please install FFmpeg (includes ffprobe)."
-        )
-
+async def ffprobe_get_info(
+    input_file: str, pretty_json: bool = True, timeout_s: float | None = 0
+) -> str:
+    """FFprobe info (structured JSON)."""
     if not os.path.exists(input_file):
-        return create_error_response(f"Input file '{input_file}' does not exist.")
+        return err_response(f"Input file '{input_file}' does not exist.")
 
-    # Get detailed info in JSON format
-    cmd = [
+    # Use ffprobe JSON output, then wrap in our standard envelope.
+    argv = [
         "ffprobe",
         "-v",
         "quiet",
@@ -179,134 +275,31 @@ async def ffmpeg_get_info(input_file: str) -> str:
         "-show_streams",
         input_file,
     ]
+    raw = await _run_ffmpeg_command_impl(argv=argv, timeout_s=timeout_s)
+    data = json.loads(raw)
+    if not data.get("success"):
+        return raw
 
-    result = await run_command(cmd)
-
-    if result["returncode"] == 0:
-        try:
-            info = json.loads(result["stdout"])
-            return create_success_response({"file": input_file, "info": info})
-        except json.JSONDecodeError:
-            return create_error_response(
-                "Failed to parse ffprobe output",
-                stdout=result["stdout"],
-                stderr=result["stderr"],
-            )
-    else:
-        return create_error_response(
-            "FFprobe failed",
-            command=result["command"],
-            stdout=result["stdout"],
-            stderr=result["stderr"],
+    try:
+        info = json.loads(data.get("stdout", "{}"))
+    except json.JSONDecodeError:
+        return err_response(
+            "Failed to parse ffprobe JSON",
+            stdout=data.get("stdout", ""),
+            stderr=data.get("stderr", ""),
         )
 
-
-@mcp.resource("urn:ffmpeg:args")
-async def get_ffmpeg_args() -> str:
-    """Get comprehensive FFmpeg command line arguments reference."""
-    return """# FFmpeg Command Line Arguments Reference
-
-## Basic Usage
-```bash
-ffmpeg -i input.mp4 output.mp4
-```
-
-## Input/Output Options
-- `-i <file>` - Input file
-- `-y` - Overwrite output files without asking
-- `-n` - Do not overwrite output files
-- `-f <format>` - Force format
-
-## Video Codec Options
-- `-c:v <codec>` - Video codec
-  - `libx264` - H.264 (most compatible)
-  - `libx265` - H.265/HEVC (better compression)
-  - `libvpx-vp9` - VP9 (for WebM)
-  - `copy` - Copy without re-encoding
-
-## Audio Codec Options
-- `-c:a <codec>` - Audio codec
-  - `libmp3lame` - MP3
-  - `aac` - AAC
-  - `libopus` - Opus
-  - `copy` - Copy without re-encoding
-- `-an` - Disable audio
-- `-vn` - Disable video
-
-## Quality Settings
-- `-crf <value>` - Constant Rate Factor (0-51, lower = better quality)
-- `-b:v <bitrate>` - Video bitrate (e.g., "2M", "1000k")
-- `-b:a <bitrate>` - Audio bitrate (e.g., "192k", "128k")
-- `-q:v <value>` - Variable bitrate quality (codec dependent)
-
-## Resolution and Scaling
-- `-s <size>` - Set frame size (WxH)
-- `-vf scale=<width>:<height>` - Scale video
-- `-vf scale=-1:720` - Scale to 720p height, maintain aspect ratio
-- `-vf scale=1920:-1` - Scale to 1920px width, maintain aspect ratio
-
-## Frame Rate
-- `-r <fps>` - Set frame rate
-- `-vf fps=<fps>` - Change frame rate with filtering
-
-## Time and Seeking
-- `-ss <time>` - Start time (e.g., "00:01:30", "90")
-- `-t <duration>` - Duration (e.g., "00:01:00", "60")
-- `-to <time>` - End time
-
-## Filters
-- `-vf <filter>` - Video filter
-- `-af <filter>` - Audio filter
-
-## Common Filter Examples
-- `-vf scale=1280:720` - Resize to 720p
-- `-vf crop=640:480:0:0` - Crop video
-- `-vf rotate=90*PI/180` - Rotate 90 degrees
-- `-af volume=0.5` - Reduce volume by half
-
-## Preset Options (for x264/x265)
-- `-preset <preset>` - Encoding speed vs compression
-  - `ultrafast`, `superfast`, `veryfast`, `faster`, `fast`, `medium`, `slow`, `slower`, `veryslow`
-
-## Tune Options (for x264/x265)
-- `-tune <tune>` - Optimize for specific content
-  - `film`, `animation`, `grain`, `stillimage`, `fastdecode`, `zerolatency`
-
-## Container Formats
-- `.mp4` - MP4 (H.264/AAC)
-- `.mkv` - Matroska (supports many codecs)
-- `.webm` - WebM (VP8/VP9/Opus)
-- `.avi` - AVI (older format)
-- `.mov` - QuickTime
-
-## Examples
-```bash
-# Convert to MP4 with good quality
-ffmpeg -i input.avi -c:v libx264 -crf 23 -c:a aac -b:a 192k output.mp4
-
-# Extract audio as MP3
-ffmpeg -i input.mp4 -vn -c:a libmp3lame -b:a 192k output.mp3
-
-# Resize video to 720p
-ffmpeg -i input.mp4 -vf scale=-1:720 -c:a copy output_720p.mp4
-
-# Cut video from 1 minute to 2 minutes
-ffmpeg -i input.mp4 -ss 00:01:00 -to 00:02:00 -c copy output_cut.mp4
-
-# Convert to WebM for web
-ffmpeg -i input.mp4 -c:v libvpx-vp9 -b:v 1M -c:a libopus output.webm
-```
-"""
+    return ok_response(
+        file=input_file,
+        info=info if not pretty_json else json.loads(json.dumps(info, indent=2)),
+        meta={
+            k: data[k] for k in ("returncode", "command_str", "duration_s") if k in data
+        },
+    )
 
 
 def main():
-    """Run the FFmpeg MCP server."""
-    # Check dependencies on startup
-    if not check_dependencies("ffmpeg", "ffprobe"):
-        logger.error(
-            "FFmpeg dependencies are missing. The server will still start but functions will not work."
-        )
-
+    _ = which_all("ffmpeg", "ffprobe")
     mcp.run()
 
 

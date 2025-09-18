@@ -22,7 +22,7 @@ dev:
 
 fix: dev
 	uv run black .
-	uv run ruff check --fix .
+	uv run ruff check --fix . --unsafe-fixes
 
 run:
 	uv run -m src.servers.web
