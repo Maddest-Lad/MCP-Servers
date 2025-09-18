@@ -45,17 +45,6 @@ def generate_config():
             "cwd": str(project_root),
         }
 
-    # Print both configs
-    print("=" * 60)
-    print("Standard Python Configuration:")
-    print("=" * 60)
-    print(json.dumps(config, indent=2))
-
-    print("\n" + "=" * 60)
-    print("UV-based Configuration:")
-    print("=" * 60)
-    print(json.dumps(config_with_uv, indent=2))
-
     # Save to file
     configs_dir = project_root / "configs"
     configs_dir.mkdir(exist_ok=True)
@@ -63,7 +52,7 @@ def generate_config():
     with open(configs_dir / "mcp_config.json", "w") as f:
         json.dump(config_with_uv, f, indent=2)
 
-    print(f"\n[OK] Config saved to {configs_dir / 'mcp_config.json'}")
+    print(f"\nConfig saved to {configs_dir / 'mcp_config.json'}")
 
 
 if __name__ == "__main__":

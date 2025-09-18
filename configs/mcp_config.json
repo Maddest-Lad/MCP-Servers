@@ -1,5 +1,14 @@
 {
   "mcpServers": {
+    "media": {
+      "command": "uv",
+      "args": [
+        "run",
+        "-m",
+        "src.servers.media"
+      ],
+      "cwd": "C:\\Users\\sam\\Desktop\\Projects\\MCP-Servers"
+    },
     "web": {
       "command": "uv",
       "args": [
