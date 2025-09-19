@@ -13,6 +13,7 @@ dependencies = [
     "duckduckgo-search>=4.0.0",
     "yt-dlp>=2023.7.6",
     "mutagen>=1.47.0",
+    "pillow>=11.3.0",
 ]
 
 [project.optional-dependencies]
