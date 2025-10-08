@@ -8,30 +8,21 @@ from pathlib import Path
 def generate_config():
     """Generate MCP config for all servers."""
 
-    servers_dir = Path(__file__).parent / "servers"
+    src_dir = Path(__file__).parent
     project_root = Path(__file__).parent.parent
 
-    config = {"mcpServers": {}}
-
-    # Find all .py files in servers directory
-    for server_file in servers_dir.glob("*.py"):
-        if server_file.name.startswith("_"):
-            continue
-
-        server_name = server_file.stem.replace("_", "-")
-
-        config["mcpServers"][server_name] = {
-            "command": "python",
-            "args": [str(server_file.absolute())],
-        }
-
-    # Also generate uv-based configs
     config_with_uv = {"mcpServers": {}}
-    for server_file in servers_dir.glob("*.py"):
-        if server_file.name.startswith("_"):
+
+    # Find all server directories (containing server.py files)
+    for server_dir in src_dir.iterdir():
+        if not server_dir.is_dir() or server_dir.name.startswith("_"):
             continue
 
-        server_name = server_file.stem.replace("_", "-")
+        server_file = server_dir / "server.py"
+        if not server_file.exists():
+            continue
+
+        server_name = server_dir.name.replace("_", "-")
 
         # Convert file path to module path for uv
         relative_path = server_file.relative_to(project_root)

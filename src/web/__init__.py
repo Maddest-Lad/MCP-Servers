@@ -1,0 +1,1 @@
+"""Web MCP Server module."""

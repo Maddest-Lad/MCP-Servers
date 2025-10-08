@@ -6,7 +6,7 @@ from typing import Any
 import yt_dlp
 from fastmcp import FastMCP
 
-from src.utils.youtube_helpers import (
+from src.youtube.helpers import (
     NULL_LOGGER,
     apply_flac_metadata,
     basic_meta,

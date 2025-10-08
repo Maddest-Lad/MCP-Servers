@@ -8,7 +8,7 @@ from duckduckgo_search import DDGS
 from fastmcp import FastMCP
 from markdownify import markdownify
 
-from ..utils.web_helpers import (
+from src.web.helpers import (
     MAX_PAGE_LENGTH,
     REQUEST_TIMEOUT,
     UNSAFE_SCHEMES,

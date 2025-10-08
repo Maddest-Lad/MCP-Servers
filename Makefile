@@ -25,7 +25,7 @@ fix: dev
 	uv run ruff check --fix . --unsafe-fixes
 
 run:
-	uv run -m src.servers.web
+	uv run src/web/server.py
 
 # Generate Config Files
 config:
