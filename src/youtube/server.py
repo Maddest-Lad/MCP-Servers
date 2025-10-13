@@ -1,9 +1,10 @@
 from __future__ import annotations
 
 import logging
-from typing import Any
+from typing import Any, Iterable, Optional, Tuple
 
 import yt_dlp
+from yt_dlp.utils import DownloadError
 from fastmcp import FastMCP
 
 from src.youtube.helpers import (
@@ -27,24 +28,99 @@ mcp = FastMCP("youtube")
 DEFAULT_FILENAME_TEMPLATE = "%(title)s.%(ext)s"
 
 
+# ---------- Internal helpers for picking a format ----------
+
+_CODEC_PREF = [
+    "opus",
+    "aac", "mp4a",
+    "vorbis", "ogg",
+    "mp3",
+    "eac3", "ac3",
+    "dts",
+    "flac", "alac",
+    "pcm", "wav", "lpcm",
+]
+
+def _codec_rank(codec: Optional[str]) -> int:
+    if not codec:
+        return -999
+    lc = codec.lower()
+    # some formats report like "mp4a.40.2" or "opus"
+    for i, pref in enumerate(_CODEC_PREF):
+        if pref in lc:
+            return len(_CODEC_PREF) - i
+    return 0
+
+def _num(x) -> float:
+    try:
+        return float(x) if x is not None else 0.0
+    except Exception:
+        return 0.0
+
+def _pick_best_audio_format(formats: Iterable[dict[str, Any]]) -> Tuple[Optional[dict[str, Any]], Optional[dict[str, Any]]]:
+    """
+    Returns (best_audio_only, best_muxed_with_audio)
+    - best_audio_only: vcodec == 'none'
+    - best_muxed_with_audio: has audio and video
+    Ranking:
+      1) Prefer audio-only over muxed.
+      2) Prefer better codec by _codec_rank.
+      3) Prefer higher audio bitrate (abr then tbr).
+      4) Prefer higher asr (audio sample rate).
+      5) Fallback by filesize or general tbr if present.
+    """
+    audio_only = []
+    muxed = []
+    for f in formats:
+        acodec = f.get("acodec")
+        if not acodec or acodec == "none":
+            continue
+        if (f.get("vcodec") or "") == "none":
+            audio_only.append(f)
+        else:
+            muxed.append(f)
+
+    def score(f: dict[str, Any]) -> Tuple[int, float, float, float, float]:
+        # (codec_score, abr, tbr, asr, filesize/tbr as tie breakers)
+        return (
+            _codec_rank(f.get("acodec")),
+            _num(f.get("abr")),
+            _num(f.get("tbr")),
+            _num(f.get("asr")),
+            _num(f.get("filesize") or f.get("filesize_approx") or f.get("tbr")),
+        )
+
+    best_audio = max(audio_only, key=score) if audio_only else None
+    best_muxed = max(muxed, key=score) if muxed else None
+    return best_audio, best_muxed
+
+
+# ---------- Tools ----------
+
 @mcp.tool
 async def get_info(
     url: str,
     include_formats: bool = False,
     verbose: bool = False,
+    cookiefile: str | None = None,
 ) -> dict[str, Any]:
     """
-    Extract metadata without downloading.
+    Extract metadata without downloading. Ignores any user/system yt-dlp configs.
     """
     opts = {
+        "ignoreconfig": True,  # avoid ~/.config/yt-dlp/config affecting behavior
         "quiet": True,
         "no_warnings": True,
         "extract_flat": False,
+        "noprogress": True,
+        "cookiefile": cookiefile,
+        # Try multiple player clients (can help with some age-gated/region quirks)
+        "extractor_args": {"youtube": {"player_client": ["android", "ios", "web"]}},
     }
 
     def extract():
         with silence_stdio():
-            with yt_dlp.YoutubeDL({**opts, "logger": NULL_LOGGER, "noprogress": True}) as ydl:  # type: ignore
+            with yt_dlp.YoutubeDL({**opts, "logger": NULL_LOGGER}) as ydl:  # type: ignore
                 return ydl.extract_info(url, download=False)
 
     info = await to_thread(extract)
@@ -65,41 +141,87 @@ async def download_audio_flac(
     embed_thumbnail: bool = True,
     llm_tags: dict[str, str] | None = None,
     cleanup_covers: bool = True,
+    cookiefile: str | None = None,
 ) -> dict[str, Any]:
     """
-    Download best audio, convert to FLAC, then apply FLAC metadata (optionally using LLM-provided tags).
+    Download best available audio (programmatic selection), convert to FLAC,
+    then apply FLAC metadata (optionally using LLM-provided tags).
     """
     outdir = ensure_dir(output_dir)
     tmpl = filename_template or DEFAULT_FILENAME_TEMPLATE
 
-    # Convert to FLAC regardless of source
-
-    # For FLAC we’ll embed cover ourselves; still ask yt-dlp to fetch thumbnails
-    opts = {
+    base_opts = {
+        "ignoreconfig": True,      # critical to avoid user/system config interference
         "quiet": True,
         "no_warnings": True,
-        "noprogress": True,  # <— important
-        "format": "bestaudio/best",
-        "outtmpl": str(outdir / tmpl),
-        "postprocessors": [{"key": "FFmpegExtractAudio", "preferredcodec": "flac"}],
-        "writethumbnail": bool(embed_thumbnail),
+        "noprogress": True,
         "prefer_ffmpeg": True,
+        "outtmpl": str(outdir / tmpl),
+        "writethumbnail": bool(embed_thumbnail),
+        "postprocessors": [{"key": "FFmpegExtractAudio", "preferredcodec": "flac"}],
+        "cookiefile": cookiefile,
+        # Helps with some edge cases
+        "extractor_args": {"youtube": {"player_client": ["android", "ios", "web"]}},
     }
 
-    def download():
+    # 1) Extract formats first (no download)
+    def extract_info_only():
         with silence_stdio():
-            with yt_dlp.YoutubeDL({**opts, "logger": NULL_LOGGER}) as ydl:  # type: ignore
+            with yt_dlp.YoutubeDL({**base_opts, "logger": NULL_LOGGER}) as ydl:  # type: ignore
+                return ydl.extract_info(url, download=False)
+
+    try:
+        info = await to_thread(extract_info_only)
+    except DownloadError as e:
+        raise RuntimeError(f"Failed to probe formats for {url}: {e}") from e
+
+    # 2) Decide the exact format_id to request
+    fmts = info.get("formats") or []
+    best_audio, best_muxed = _pick_best_audio_format(fmts)
+
+    chosen: Optional[dict[str, Any]] = best_audio or best_muxed
+    if not chosen:
+        # As a last resort, if formats list is empty (geo/age/blocked), try plain 'bestaudio/best'
+        # (still more robust than failing outright)
+        chosen_format_str = "bestaudio/best"
+    else:
+        # Prefer an explicit format_id to avoid expression filtering issues
+        fmt_id = chosen.get("format_id")
+        chosen_format_str = fmt_id if fmt_id else "bestaudio/best"
+
+    # 3) Download with the chosen format
+    def do_download(fmt: str):
+        with silence_stdio():
+            with yt_dlp.YoutubeDL({**base_opts, "format": fmt, "logger": NULL_LOGGER}) as ydl:  # type: ignore
                 return ydl.extract_info(url, download=True)
 
-    result = await to_thread(download)
+    result: dict[str, Any] | None = None
+    last_err: Exception | None = None
 
-    # Determine final .flac path (prefer yt-dlp reported path; fallback by title)
+    try:
+        result = await to_thread(do_download, chosen_format_str)
+    except DownloadError as e:
+        last_err = e
+        # If we tried a specific format_id and it somehow vanished, one more shot with 'bestaudio/best'
+        if chosen and chosen_format_str != "bestaudio/best":
+            try:
+                result = await to_thread(do_download, "bestaudio/best")
+            except DownloadError as e2:
+                last_err = e2
+
+    if not result:
+        raise RuntimeError(
+            f"Failed to download audio for {url}. Last error: {last_err}"
+        )
+
+    # 4) Determine final .flac path (prefer yt-dlp reported path; fallback by title)
     final_path = pick_final_path_from_result(result)
     if final_path is None or final_path.suffix.lower() != ".flac":
-        title = result.get("title") or "audio"
+        title = result.get("title") or info.get("title") or "audio"
         final_path = outdir / f"{title}.flac"
 
-    meta = basic_meta(result)
+    # 5) Tagging
+    meta = basic_meta(result if result else info)
     tags = {
         "title": (llm_tags or {}).get("title") or meta.get("title"),
         "artist": (llm_tags or {}).get("artist") or meta.get("uploader"),
@@ -115,7 +237,6 @@ async def download_audio_flac(
     cover_converted: str | None = None
 
     if cover_original:
-        # Convert to PNG (off the main loop)
         cover_converted = await to_thread(ensure_png_cover, cover_original)
 
     applied = await to_thread(
@@ -126,22 +247,21 @@ async def download_audio_flac(
         album=tags["album"],
         date=tags["date"],
         comment=tags["comment"],
-        cover_image_path=cover_converted or cover_original,  # prefer PNG
+        cover_image_path=cover_converted or cover_original,
     )
 
-    # Best-effort cleanup after successful tagging
+    # 6) Cleanup sidecar images (optional)
     deleted: dict[str, bool] = {}
     if cleanup_covers and (cover_original or cover_converted):
         to_delete = []
-        # Delete converted PNG
         if cover_converted:
             to_delete.append(cover_converted)
-        # Delete original if different from converted
         if cover_original and cover_original != cover_converted:
             to_delete.append(cover_original)
         if to_delete:
             deleted = await to_thread(cleanup_files, to_delete)
 
+    # 7) Return
     return {
         "url": url,
         "file_path": str(final_path),
@@ -150,6 +270,7 @@ async def download_audio_flac(
         "source_metadata": meta,
         "embedded_thumbnail": bool(cover_converted or cover_original),
         "cover_cleanup": deleted,
+        "chosen_format": chosen_format_str,
     }
 
 
