@@ -220,3 +220,6 @@ __marimo__/
 
 # Config
 configs/
+
+# Local Docs
+docs/

@@ -24,6 +24,26 @@ src/
 ### HTTP Request Tools
 - **http_request**: Make HTTP requests (GET, POST, PUT, DELETE, PATCH) to any URL
 
+## Plexamp Music Server (`src/plexamp`)
+
+A music-only server for Plex Media Server over the LAN. It covers search and browse, sonic similarity and Sonic Adventure, stations, audio and smart playlists, play queues, and control of Plexamp / Plexamp Headless players. The full tool and endpoint reference is in [docs/plexamp-mcp-spec.md](docs/plexamp-mcp-spec.md).
+
+Copy `.env.template` to `.env` in the repo root and fill it in:
+
+```env
+PLEX_URL=http://192.168.1.10:32400   # LAN address (players connect back to it)
+PLEX_TOKEN=your-plex-token
+PLEX_MUSIC_SECTIONS=                 # optional: comma-separated section ids
+PLEXAMP_PLAYERS=192.168.1.20:32500   # optional: headless players PMS doesn't list
+```
+
+Run it with `uv run -m src.plexamp.server`, or inspect it with `uv run fastmcp dev src/plexamp/server.py`.
+
+- **Find**: `music_search`, `music_browse`, `music_get_item`, `music_get_track_files`, `music_get_recent`, `music_get_hubs`
+- **Discover**: `music_list_stations`, `music_start_radio`, `music_similar_tracks`, `music_sonic_adventure`
+- **Playlists**: `music_list_playlists`, `music_get_playlist`, `music_create_playlist`, `music_update_playlist`, `music_add_playlist_tracks`, `music_remove_playlist_items`, `music_move_playlist_item`, `music_delete_playlist`
+- **Queue and players**: `music_play`, `music_get_queue`, `music_queue_items`, `music_move_queue_item`, `music_remove_queue_item`, `music_list_players`, `music_now_playing`, `music_control_player`
+
 ## Installation
 
 This server requires Python 3.10 or higher and uses [uv](https://github.com/astral-sh/uv) for dependency management.
