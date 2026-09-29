@@ -1,15 +1,22 @@
 #!/usr/bin/env python3
 """Generate MCP configuration for all servers."""
 
+import importlib
 import json
+import sys
 from pathlib import Path
 
 
 def generate_config():
-    """Generate MCP config for all servers."""
+    """Generate MCP config for all servers.
+
+    Servers run over stdio via uv unless their server module defines
+    `MCP_CONFIG` (e.g. an HTTP server with OAuth), which is used as-is.
+    """
 
     src_dir = Path(__file__).parent
     project_root = Path(__file__).parent.parent
+    sys.path.insert(0, str(project_root))
 
     config_with_uv = {"mcpServers": {}}
 
@@ -30,7 +37,8 @@ def generate_config():
             str(relative_path.with_suffix("")).replace("\\", ".").replace("/", ".")
         )
 
-        config_with_uv["mcpServers"][server_name] = {
+        override = getattr(importlib.import_module(module_path), "MCP_CONFIG", None)
+        config_with_uv["mcpServers"][server_name] = override or {
             "command": "uv",
             "args": ["run", "-m", module_path],
             "cwd": str(project_root),

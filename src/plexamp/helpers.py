@@ -16,8 +16,9 @@ from fastmcp.exceptions import ToolError
 
 load_dotenv()
 
-PLEX_URL = os.getenv("PLEX_URL", "http://127.0.0.1:32400").rstrip("/")
-PLEX_TOKEN = os.getenv("PLEX_TOKEN", "")
+# Optional overrides; normally the server and token come from sign-in (auth.py).
+PLEX_URL = (os.getenv("PLEX_URL") or "").rstrip("/") or None
+PLEX_TOKEN = os.getenv("PLEX_TOKEN") or None
 PLEX_CLIENT_ID = os.getenv("PLEX_CLIENT_ID") or str(
     uuid.uuid5(uuid.NAMESPACE_DNS, f"plexamp-mcp.{platform.node()}")
 )
@@ -28,6 +29,9 @@ PLEX_MUSIC_SECTIONS = {
 PLEXAMP_PLAYERS = [
     p.strip() for p in os.getenv("PLEXAMP_PLAYERS", "").split(",") if p.strip()
 ]
+PLEXAMP_HOST = os.getenv("PLEXAMP_HOST", "127.0.0.1")
+PLEXAMP_PORT = int(os.getenv("PLEXAMP_PORT", "8765"))
+PLEXAMP_TRANSPORT = os.getenv("PLEXAMP_TRANSPORT", "http")
 
 MAX_LIMIT = 200
 TYPE_IDS = {"artist": 8, "album": 9, "track": 10}
@@ -47,16 +51,18 @@ class PlexError(ToolError):
         super().__init__(json.dumps(payload, default=str))
 
 
-def plex_headers(token: str = PLEX_TOKEN) -> dict[str, str]:
-    return {
+def plex_headers(token: str | None = None) -> dict[str, str]:
+    headers = {
         "Accept": "application/json",
-        "X-Plex-Token": token,
         "X-Plex-Client-Identifier": PLEX_CLIENT_ID,
         "X-Plex-Product": "plexamp-mcp",
         "X-Plex-Version": "1.0.0",
         "X-Plex-Device-Name": f"plexamp-mcp ({platform.node()})",
         "X-Plex-Platform": platform.system(),
     }
+    if token:
+        headers["X-Plex-Token"] = token
+    return headers
 
 
 def clamp(limit: int, maximum: int = MAX_LIMIT) -> int:
@@ -78,22 +84,34 @@ class PlexClient:
 
     def __init__(
         self,
-        base_url: str = PLEX_URL,
-        token: str = PLEX_TOKEN,
+        base_url: str | None = None,
+        token: str | None = None,
         transport: httpx.AsyncBaseTransport | None = None,
     ):
-        self.base_url = base_url
-        self.token = token
         self.transport = transport  # shared with player requests (tests)
-        self._http = httpx.AsyncClient(
-            base_url=base_url,
-            headers=plex_headers(token),
-            timeout=PLEX_TIMEOUT,
-            transport=transport,
-        )
+        self._http = httpx.AsyncClient(timeout=PLEX_TIMEOUT, transport=transport)
+        self._from_store = False
+        self._use(base_url, token)
+
+    def _use(self, base_url: str | None, token: str | None) -> None:
+        """Point the client at a server; None means resolve on first request."""
+        self.base_url, self.token = base_url, token
+        self._http.headers = plex_headers(token)
+        if base_url:
+            self._http.base_url = base_url
         self._machine_id: str | None = None
         self._sections: list[dict] | None = None
         self._meta: dict[tuple[str, str], dict] = {}
+
+    def reset(self) -> None:
+        """Forget the current server/token (e.g. after a new sign-in)."""
+        self._use(None, None)
+
+    async def _connect(self) -> None:
+        from src.plexamp import auth  # auth imports this module
+
+        url, token, self._from_store = await auth.resolve()
+        self._use(url, token)
 
     async def request(
         self,
@@ -104,8 +122,11 @@ class PlexClient:
         start: int | None = None,
         size: int | None = None,
         headers: dict[str, str] | None = None,
+        retry: bool = True,
     ) -> dict:
         """Return the response `MediaContainer` (or `{}` for empty bodies)."""
+        if self.base_url is None:
+            await self._connect()
         headers = dict(headers or {})
         if size is not None:  # PMS ignores Size unless Start is also sent
             headers["X-Plex-Container-Start"] = str(start or 0)
@@ -119,7 +140,7 @@ class PlexClient:
         if resp.status_code == 404:
             raise PlexError("not_found", f"{method} {path} returned 404")
         if resp.status_code == 401:
-            raise PlexError("pms_error", "Plex rejected the token (401)")
+            return await self._unauthorized(method, path, params, start, size, retry)
         if resp.status_code >= 400:
             raise PlexError(
                 "pms_error",
@@ -133,6 +154,21 @@ class PlexClient:
         except ValueError:
             return {}
         return data.get("MediaContainer", data) if isinstance(data, dict) else {}
+
+    async def _unauthorized(self, method, path, params, start, size, retry) -> dict:
+        if not self._from_store:
+            raise PlexError("pms_error", "Plex rejected PLEX_TOKEN (401)")
+        from src.plexamp import auth
+
+        if retry:  # the server's access token may have rotated: rediscover once
+            auth.forget_server()
+            self.reset()
+            return await self.request(
+                method, path, params, start=start, size=size, retry=False
+            )
+        auth.sign_out()
+        self.reset()
+        raise auth.auth_required()
 
     async def machine_id(self) -> str:
         if self._machine_id is None:

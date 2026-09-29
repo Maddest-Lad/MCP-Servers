@@ -1,11 +1,11 @@
 from __future__ import annotations
 
 import logging
-from typing import Any, Iterable, Optional, Tuple
+from typing import Any, Iterable
 
 import yt_dlp
-from yt_dlp.utils import DownloadError
 from fastmcp import FastMCP
+from yt_dlp.utils import DownloadError
 
 from src.youtube.helpers import (
     NULL_LOGGER,
@@ -32,16 +32,23 @@ DEFAULT_FILENAME_TEMPLATE = "%(title)s.%(ext)s"
 
 _CODEC_PREF = [
     "opus",
-    "aac", "mp4a",
-    "vorbis", "ogg",
+    "aac",
+    "mp4a",
+    "vorbis",
+    "ogg",
     "mp3",
-    "eac3", "ac3",
+    "eac3",
+    "ac3",
     "dts",
-    "flac", "alac",
-    "pcm", "wav", "lpcm",
+    "flac",
+    "alac",
+    "pcm",
+    "wav",
+    "lpcm",
 ]
 
-def _codec_rank(codec: Optional[str]) -> int:
+
+def _codec_rank(codec: str | None) -> int:
     if not codec:
         return -999
     lc = codec.lower()
@@ -51,13 +58,17 @@ def _codec_rank(codec: Optional[str]) -> int:
             return len(_CODEC_PREF) - i
     return 0
 
+
 def _num(x) -> float:
     try:
         return float(x) if x is not None else 0.0
     except Exception:
         return 0.0
 
-def _pick_best_audio_format(formats: Iterable[dict[str, Any]]) -> Tuple[Optional[dict[str, Any]], Optional[dict[str, Any]]]:
+
+def _pick_best_audio_format(
+    formats: Iterable[dict[str, Any]],
+) -> tuple[dict[str, Any] | None, dict[str, Any] | None]:
     """
     Returns (best_audio_only, best_muxed_with_audio)
     - best_audio_only: vcodec == 'none'
@@ -80,7 +91,7 @@ def _pick_best_audio_format(formats: Iterable[dict[str, Any]]) -> Tuple[Optional
         else:
             muxed.append(f)
 
-    def score(f: dict[str, Any]) -> Tuple[int, float, float, float, float]:
+    def score(f: dict[str, Any]) -> tuple[int, float, float, float, float]:
         # (codec_score, abr, tbr, asr, filesize/tbr as tie breakers)
         return (
             _codec_rank(f.get("acodec")),
@@ -96,6 +107,7 @@ def _pick_best_audio_format(formats: Iterable[dict[str, Any]]) -> Tuple[Optional
 
 
 # ---------- Tools ----------
+
 
 @mcp.tool
 async def get_info(
@@ -151,7 +163,7 @@ async def download_audio_flac(
     tmpl = filename_template or DEFAULT_FILENAME_TEMPLATE
 
     base_opts = {
-        "ignoreconfig": True,      # critical to avoid user/system config interference
+        "ignoreconfig": True,  # critical to avoid user/system config interference
         "quiet": True,
         "no_warnings": True,
         "noprogress": True,
@@ -179,7 +191,7 @@ async def download_audio_flac(
     fmts = info.get("formats") or []
     best_audio, best_muxed = _pick_best_audio_format(fmts)
 
-    chosen: Optional[dict[str, Any]] = best_audio or best_muxed
+    chosen: dict[str, Any] | None = best_audio or best_muxed
     if not chosen:
         # As a last resort, if formats list is empty (geo/age/blocked), try plain 'bestaudio/best'
         # (still more robust than failing outright)

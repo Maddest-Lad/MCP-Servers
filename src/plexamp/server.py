@@ -2,13 +2,19 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import sys
 from typing import Any, Literal
 
 from fastmcp import FastMCP
+from starlette.requests import Request
+from starlette.responses import Response
 
 from src.plexamp import players
 from src.plexamp.helpers import (
     MUSIC_TYPES,
+    PLEXAMP_HOST,
+    PLEXAMP_PORT,
+    PLEXAMP_TRANSPORT,
     TYPE_IDS,
     PlexClient,
     PlexError,
@@ -31,6 +37,10 @@ logging.basicConfig(level=logging.INFO)
 
 mcp = FastMCP("plexamp")
 plex = PlexClient()
+
+BASE_URL = f"http://{PLEXAMP_HOST}:{PLEXAMP_PORT}"
+# Client config emitted by generate_mcp_configs.py (HTTP + OAuth, not stdio).
+MCP_CONFIG = {"type": "http", "url": f"{BASE_URL}/mcp"}
 
 MusicType = Literal["artist", "album", "track"]
 Action = Literal[
@@ -719,9 +729,25 @@ async def music_control_player(
     }
 
 
+@mcp.custom_route("/plex/callback", methods=["GET"])
+async def plex_callback(request: Request) -> Response:
+    """Plex forwards here after the user approves sign-in (see auth.py)."""
+    response = await mcp.auth.callback(request)
+    if response.status_code == 302:
+        plex.reset()  # new account/server: rediscover on next request
+    return response
+
+
 def main() -> None:
-    logger.info("plexamp MCP server starting")
-    mcp.run()
+    """Serve over HTTP with Plex sign-in (default), or `--stdio` using env PLEX_TOKEN."""
+    if "--stdio" in sys.argv or PLEXAMP_TRANSPORT == "stdio":
+        mcp.run()
+        return
+    from src.plexamp.auth import AUTH_FILE, PlexOAuthProvider
+
+    mcp.auth = PlexOAuthProvider(BASE_URL)
+    logger.info("plexamp MCP server on %s/mcp (credentials: %s)", BASE_URL, AUTH_FILE)
+    mcp.run(transport="http", host=PLEXAMP_HOST, port=PLEXAMP_PORT)
 
 
 if __name__ == "__main__":
